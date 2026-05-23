@@ -1,0 +1,11 @@
+node_modules
+dist
+__pycache__
+.pytest_cache
+.DS_Store
+postgres_data
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log

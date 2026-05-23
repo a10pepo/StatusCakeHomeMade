@@ -1,0 +1,14 @@
+project_id      = "edem2526"
+region          = "europe-north2"
+name_prefix     = "statuscake"
+deploy_services = false
+
+db_name     = "statuscake"
+db_username = "statuscake"
+
+frontend_origin = "*"
+
+tags = {
+  project = "statuscake-home-made"
+  owner   = "pedro-nieto"
+}
