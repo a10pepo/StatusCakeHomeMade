@@ -22,6 +22,12 @@ variable "deploy_services" {
   default     = true
 }
 
+variable "manage_project_services" {
+  description = "When true, Terraform enables the required Google APIs for the project. Set false when API enablement is handled outside Terraform."
+  type        = bool
+  default     = true
+}
+
 variable "backend_image_tag" {
   description = "Docker tag to deploy from the backend Artifact Registry repository."
   type        = string
@@ -74,6 +80,18 @@ variable "backend_cpu" {
   description = "Backend Cloud Run CPU limit."
   type        = string
   default     = "1"
+}
+
+variable "backend_min_instances" {
+  description = "Minimum number of backend Cloud Run instances kept warm."
+  type        = number
+  default     = 1
+}
+
+variable "backend_max_instances" {
+  description = "Maximum number of backend Cloud Run instances allowed to scale out to."
+  type        = number
+  default     = 3
 }
 
 variable "backend_memory" {

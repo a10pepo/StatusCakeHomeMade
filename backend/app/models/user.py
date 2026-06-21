@@ -6,6 +6,12 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 
+class UserRole:
+    ADMIN = "admin"
+    OWNER = "owner"
+    READONLY = "readonly"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -13,6 +19,7 @@ class User(Base):
     username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default=UserRole.OWNER, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     applications = relationship("Application", back_populates="owner")

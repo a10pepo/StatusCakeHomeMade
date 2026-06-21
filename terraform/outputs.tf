@@ -40,6 +40,11 @@ output "backend_service_url" {
   value       = var.deploy_services ? google_cloud_run_v2_service.backend[0].uri : null
 }
 
+output "backend_service_name" {
+  description = "Backend Cloud Run service name when services are deployed."
+  value       = var.deploy_services ? google_cloud_run_v2_service.backend[0].name : null
+}
+
 output "frontend_service_url" {
   description = "Frontend Cloud Run URL when services are deployed."
   value       = var.deploy_services ? google_cloud_run_v2_service.frontend[0].uri : null

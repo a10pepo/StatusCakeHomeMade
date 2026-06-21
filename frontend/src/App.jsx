@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CartesianGrid,
+  Legend,
   Line,
   LineChart,
   ResponsiveContainer,
@@ -65,6 +66,19 @@ function formatTimelineLabel(timestamp) {
   });
 }
 
+function formatRangeDateTime(value) {
+  if (!value) {
+    return "--";
+  }
+  return new Date(value).toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function formatResponseTime(value) {
   if (value === null || value === undefined) {
     return "N/A";
@@ -73,6 +87,41 @@ function formatResponseTime(value) {
     return `${(value / 1000).toFixed(2)} s`;
   }
   return `${value.toFixed(1)} ms`;
+}
+
+function formatElapsedTime(elapsedMs) {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes === 0) {
+    return `${seconds}s`;
+  }
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+function formatPercentage(value) {
+  if (value === null || value === undefined) {
+    return "--";
+  }
+  return `${value.toFixed(3)}%`;
+}
+
+function buildTestUrl(applicationUrl, endpoint) {
+  if (!endpoint) {
+    return applicationUrl;
+  }
+  if (/^https?:\/\//i.test(endpoint)) {
+    return endpoint;
+  }
+  try {
+    return new URL(endpoint, `${applicationUrl.replace(/\/+$/, "")}/`).toString();
+  } catch {
+    return endpoint;
+  }
+}
+
+function sleep(delayMs) {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
 }
 
 function buildGlobalTimeline(applications, historiesByApplication) {
@@ -108,6 +157,14 @@ function buildApplicationTimeline(history, tests) {
     }));
 }
 
+function sortDashboardEntries(entries) {
+  return [...entries].sort(
+    (left, right) =>
+      compareValues(left.global_score, right.global_score, "desc") ||
+      compareValues(left.healthy_score, right.healthy_score, "desc"),
+  );
+}
+
 function App() {
   const [token, setToken] = useState(localStorage.getItem("statuscake-token") || "");
   const [user, setUser] = useState(null);
@@ -124,13 +181,14 @@ function App() {
   const [landingWindowHours, setLandingWindowHours] = useState("24");
   const [landingEndAt, setLandingEndAt] = useState(() => toDateTimeLocalInput(new Date()));
   const [landingStartAt, setLandingStartAt] = useState(() => toDateTimeLocalInput(new Date(Date.now() - (24 * 60 * 60 * 1000))));
+  const [dashboardRange, setDashboardRange] = useState({ startAt: "", endAt: "" });
   const [errorCode, setErrorCode] = useState("");
   const [applicationForm, setApplicationForm] = useState(defaultApplicationForm);
   const [testForm, setTestForm] = useState(defaultTestForm);
+  const [editingApplicationId, setEditingApplicationId] = useState(null);
   const [editingTestId, setEditingTestId] = useState(null);
   const [showApplicationModal, setShowApplicationModal] = useState(false);
   const [showTestModal, setShowTestModal] = useState(false);
-  const [sampleState, setSampleState] = useState({ loaded: false, loaded_at: null });
   const [latestTestsQuery, setLatestTestsQuery] = useState("");
   const [latestTestsStatusFilter, setLatestTestsStatusFilter] = useState("");
   const [latestTestsSort, setLatestTestsSort] = useState({ key: "last_checked_at", direction: "desc" });
@@ -139,107 +197,278 @@ function App() {
   const [recentResultsSort, setRecentResultsSort] = useState({ key: "started_at", direction: "desc" });
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [landingRequestProgress, setLandingRequestProgress] = useState({
+    active: false,
+    title: "",
+    currentStep: "",
+    completedSteps: 0,
+    totalSteps: 0,
+    startedAt: 0,
+  });
+  const [landingElapsedMs, setLandingElapsedMs] = useState(0);
+  const landingSyncInFlightRef = useRef(false);
+  const pendingLandingSyncRef = useRef(null);
 
   useEffect(() => {
     if (!token) {
       return;
     }
     localStorage.setItem("statuscake-token", token);
-    hydrate(token);
+    void hydrate(token);
   }, [token]);
-
-  useEffect(() => {
-    if (!token || applications.length === 0) {
-      return;
-    }
-    loadGlobalTimeline();
-  }, [token, applications, landingWindowHours, landingStartAt, landingEndAt]);
-
-  useEffect(() => {
-    if (!token) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      if (currentView.type === "landing") {
-        refreshLanding();
-      } else if (currentView.applicationId) {
-        refreshApplicationView(currentView.applicationId, false);
-      }
-    }, 5000);
-
-    return () => window.clearInterval(intervalId);
-  }, [token, currentView, applications, landingWindowHours, landingStartAt, landingEndAt, windowHours, errorCode]);
 
   useEffect(() => {
     if (!token || currentView.type !== "application" || !currentView.applicationId) {
       return;
     }
-    loadApplicationContext(currentView.applicationId, windowHours, errorCode);
+    void loadApplicationContext(currentView.applicationId, windowHours, errorCode);
   }, [token, currentView, windowHours, errorCode]);
+
+  useEffect(() => {
+    if (!token || !user || currentView.type !== "landing") {
+      return;
+    }
+    enqueueLandingSync({
+      activeToken: token,
+      applicationList: applications,
+      startAt: landingStartAt,
+      endAt: landingEndAt,
+      includeDashboard: false,
+      includeTimeline: true,
+    });
+  }, [token, user, currentView.type, applications, landingStartAt, landingEndAt]);
+
+  useEffect(() => {
+    if (!landingRequestProgress.active || !landingRequestProgress.startedAt) {
+      setLandingElapsedMs(0);
+      return undefined;
+    }
+    setLandingElapsedMs(Date.now() - landingRequestProgress.startedAt);
+    const intervalId = window.setInterval(() => {
+      setLandingElapsedMs(Date.now() - landingRequestProgress.startedAt);
+    }, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [landingRequestProgress.active, landingRequestProgress.startedAt]);
+
+  async function loadApplicationConfigs(activeToken) {
+    const configs = await api.listApplicationConfigs(activeToken);
+    setApplications(configs);
+    return configs;
+  }
 
   async function hydrate(activeToken) {
     try {
       setLoading(true);
-      const [me, apps, dashboardData, sample] = await Promise.all([
+      const [me] = await Promise.all([
         api.me(activeToken),
-        api.listApplications(activeToken),
-        api.dashboard(activeToken, landingStartAt, landingEndAt),
-        api.sampleStatus(activeToken),
+        loadApplicationConfigs(activeToken),
       ]);
       setUser(me);
-      setApplications(apps);
-      setDashboard(dashboardData);
-      setSampleState(sample);
       setMessage("");
     } catch (error) {
       setMessage(error.message);
-      logout();
+      if (error.status === 401) {
+        logout();
+      }
     } finally {
       setLoading(false);
     }
   }
 
-  async function refreshLanding() {
-    const [apps, dashboardData, sample] = await Promise.all([
-      api.listApplications(token),
-      api.dashboard(token, landingStartAt, landingEndAt),
-      api.sampleStatus(token),
-    ]);
-    setApplications(apps);
-    setDashboard(dashboardData);
-    setSampleState(sample);
+  function buildLandingSyncJob(job) {
+    return {
+      activeToken: job.activeToken ?? token,
+      applicationList: job.applicationList ?? applications,
+      startAt: job.startAt ?? landingStartAt,
+      endAt: job.endAt ?? landingEndAt,
+      includeDashboard: Boolean(job.includeDashboard),
+      includeTimeline: Boolean(job.includeTimeline),
+    };
+  }
 
-    if (apps.length > 0) {
-      const histories = await Promise.all(
-        apps.map((application) => api.historyRange(token, application.id, landingStartAt, landingEndAt, "")),
-      );
-      const byApplication = Object.fromEntries(apps.map((application, index) => [application.id, histories[index]]));
-      setGlobalTimeline(buildGlobalTimeline(apps, byApplication));
-    } else {
-      setGlobalTimeline([]);
+  function mergeLandingSyncJobs(currentJob, nextJob) {
+    if (!currentJob) {
+      return nextJob;
+    }
+    return {
+      ...currentJob,
+      ...nextJob,
+      includeDashboard: currentJob.includeDashboard || nextJob.includeDashboard,
+      includeTimeline: currentJob.includeTimeline || nextJob.includeTimeline,
+    };
+  }
+
+  function updateLandingRequestProgress(progress) {
+    setLandingRequestProgress((current) => ({
+      ...current,
+      ...progress,
+    }));
+  }
+
+  function enqueueLandingSync(job) {
+    const normalizedJob = buildLandingSyncJob(job);
+    const totalSteps =
+      (normalizedJob.includeDashboard ? normalizedJob.applicationList.length : 0) +
+      (normalizedJob.includeTimeline ? normalizedJob.applicationList.length : 0);
+
+    if (totalSteps === 0) {
+      if (normalizedJob.includeDashboard) {
+        setDashboard([]);
+        setDashboardRange({ startAt: normalizedJob.startAt, endAt: normalizedJob.endAt });
+      }
+      if (normalizedJob.includeTimeline) {
+        setGlobalTimeline([]);
+      }
+      return;
+    }
+
+    pendingLandingSyncRef.current = mergeLandingSyncJobs(pendingLandingSyncRef.current, normalizedJob);
+    if (!landingSyncInFlightRef.current) {
+      void drainLandingSyncQueue();
     }
   }
 
-  async function loadGlobalTimeline() {
-    const histories = await Promise.all(
-      applications.map((application) => api.historyRange(token, application.id, landingStartAt, landingEndAt, "")),
-    );
-    const byApplication = Object.fromEntries(
-      applications.map((application, index) => [application.id, histories[index]]),
-    );
-    setGlobalTimeline(buildGlobalTimeline(applications, byApplication));
+  async function drainLandingSyncQueue() {
+    if (landingSyncInFlightRef.current) {
+      return;
+    }
+
+    landingSyncInFlightRef.current = true;
+    try {
+      while (pendingLandingSyncRef.current) {
+        const job = pendingLandingSyncRef.current;
+        pendingLandingSyncRef.current = null;
+        await runLandingSync(job);
+      }
+    } finally {
+      landingSyncInFlightRef.current = false;
+      setLandingRequestProgress({
+        active: false,
+        title: "",
+        currentStep: "",
+        completedSteps: 0,
+        totalSteps: 0,
+        startedAt: 0,
+      });
+      setLandingElapsedMs(0);
+      setLoading(false);
+      setHealthLoading(false);
+    }
   }
 
-  async function loadApplicationContext(applicationId, currentWindowHours, currentErrorCode) {
-    const [testList, historySeries, results] = await Promise.all([
-      api.listTests(token, applicationId),
-      api.history(token, applicationId, currentWindowHours, currentErrorCode),
-      api.results(token, applicationId),
-    ]);
-    setTests(testList);
-    setApplicationHistory(buildApplicationTimeline(historySeries, testList));
-    setRecentResults(results);
+  async function runLandingSync(job) {
+    const totalSteps =
+      (job.includeDashboard ? job.applicationList.length : 0) +
+      (job.includeTimeline ? job.applicationList.length : 0);
+    let completedSteps = 0;
+    const historiesByApplication = {};
+    const progressTitle =
+      job.includeDashboard && job.includeTimeline
+        ? "Refreshing landing data"
+        : job.includeDashboard
+          ? "Refreshing health ranking"
+          : "Refreshing application timeline";
+
+    setLoading(job.includeTimeline);
+    setHealthLoading(job.includeDashboard);
+    setLandingRequestProgress({
+      active: true,
+      title: progressTitle,
+      currentStep: totalSteps > 0 ? "Preparing requests" : "",
+      completedSteps: 0,
+      totalSteps,
+      startedAt: Date.now(),
+    });
+
+    try {
+      setMessage("");
+
+      if (job.includeDashboard) {
+        const dashboardById = new Map(
+          dashboardRange.startAt === job.startAt && dashboardRange.endAt === job.endAt
+            ? dashboard.map((entry) => [entry.application_id, entry])
+            : [],
+        );
+
+        if (job.applicationList.length === 0) {
+          setDashboard([]);
+          setDashboardRange({ startAt: job.startAt, endAt: job.endAt });
+        } else {
+          for (const [index, application] of job.applicationList.entries()) {
+            updateLandingRequestProgress({
+              currentStep: `Loading health ${index + 1}/${job.applicationList.length}: ${application.name}`,
+            });
+            const dashboardEntry = await api.dashboardApplication(
+              job.activeToken,
+              application.id,
+              job.startAt,
+              job.endAt,
+            );
+            dashboardById.set(application.id, dashboardEntry);
+            setDashboard(sortDashboardEntries([...dashboardById.values()]));
+            setDashboardRange({ startAt: job.startAt, endAt: job.endAt });
+            completedSteps += 1;
+            updateLandingRequestProgress({ completedSteps });
+            if (index < job.applicationList.length - 1) {
+              await sleep(300);
+            }
+          }
+        }
+      }
+
+      if (job.includeTimeline) {
+        if (job.applicationList.length === 0) {
+          setGlobalTimeline([]);
+        } else {
+          for (const [index, application] of job.applicationList.entries()) {
+            updateLandingRequestProgress({
+              currentStep: `Loading timeline ${index + 1}/${job.applicationList.length}: ${application.name}`,
+            });
+            historiesByApplication[application.id] = await api.historyRange(
+              job.activeToken,
+              application.id,
+              job.startAt,
+              job.endAt,
+              "",
+            );
+            completedSteps += 1;
+            updateLandingRequestProgress({ completedSteps });
+            if (index < job.applicationList.length - 1) {
+              await sleep(300);
+            }
+          }
+          setGlobalTimeline(buildGlobalTimeline(job.applicationList, historiesByApplication));
+        }
+      }
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setLoading(false);
+      setHealthLoading(false);
+    }
+  }
+
+  async function refreshLanding(startAt = landingStartAt, endAt = landingEndAt) {
+    enqueueLandingSync({
+      activeToken: token,
+      applicationList: applications,
+      startAt,
+      endAt,
+      includeDashboard: false,
+      includeTimeline: true,
+    });
+  }
+
+  async function refreshLandingHealth(startAt = landingStartAt, endAt = landingEndAt) {
+    enqueueLandingSync({
+      activeToken: token,
+      applicationList: applications,
+      startAt,
+      endAt,
+      includeDashboard: true,
+      includeTimeline: false,
+    });
   }
 
   async function refreshApplicationView(applicationId, withLoader = true) {
@@ -247,15 +476,12 @@ function App() {
       if (withLoader) {
         setLoading(true);
       }
-      const [apps, dashboardData, testList, historySeries, results] = await Promise.all([
-        api.listApplications(token),
-        api.dashboard(token, landingStartAt, landingEndAt),
+      await loadApplicationConfigs(token);
+      const [testList, historySeries, results] = await Promise.all([
         api.listTests(token, applicationId),
         api.history(token, applicationId, windowHours, errorCode),
         api.results(token, applicationId),
       ]);
-      setApplications(apps);
-      setDashboard(dashboardData);
       setTests(testList);
       setApplicationHistory(buildApplicationTimeline(historySeries, testList));
       setRecentResults(results);
@@ -265,6 +491,24 @@ function App() {
       if (withLoader) {
         setLoading(false);
       }
+    }
+  }
+
+  async function loadApplicationContext(applicationId, currentWindowHours, currentErrorCode) {
+    try {
+      setLoading(true);
+      const [testList, historySeries, results] = await Promise.all([
+        api.listTests(token, applicationId),
+        api.history(token, applicationId, currentWindowHours, currentErrorCode),
+        api.results(token, applicationId),
+      ]);
+      setTests(testList);
+      setApplicationHistory(buildApplicationTimeline(historySeries, testList));
+      setRecentResults(results);
+    } catch (error) {
+      setMessage(error.message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -278,6 +522,7 @@ function App() {
     setRecentResults([]);
     setApplicationHistory([]);
     setGlobalTimeline([]);
+    setDashboardRange({ startAt: "", endAt: "" });
     setCurrentView({ type: "landing", applicationId: null });
   }
 
@@ -301,7 +546,18 @@ function App() {
   }
 
   async function refreshAll() {
-    await hydrate(token);
+    const appConfigs = await loadApplicationConfigs(token);
+    setDashboard([]);
+    if (currentView.type === "landing") {
+      enqueueLandingSync({
+        activeToken: token,
+        applicationList: appConfigs,
+        startAt: landingStartAt,
+        endAt: landingEndAt,
+        includeDashboard: false,
+        includeTimeline: true,
+      });
+    }
     if (currentView.type === "application" && currentView.applicationId) {
       await refreshApplicationView(currentView.applicationId, false);
     }
@@ -311,11 +567,21 @@ function App() {
     event.preventDefault();
     try {
       setLoading(true);
-      const created = await api.createApplication(token, applicationForm);
-      setApplicationForm(defaultApplicationForm);
-      setShowApplicationModal(false);
-      await refreshAll();
-      setCurrentView({ type: "application", applicationId: created.id });
+      if (editingApplicationId) {
+        const applicationId = editingApplicationId;
+        await api.updateApplication(token, applicationId, applicationForm);
+        setEditingApplicationId(null);
+        setApplicationForm(defaultApplicationForm);
+        setShowApplicationModal(false);
+        await refreshAll();
+        setCurrentView({ type: "application", applicationId });
+      } else {
+        const created = await api.createApplication(token, applicationForm);
+        setApplicationForm(defaultApplicationForm);
+        setShowApplicationModal(false);
+        await refreshAll();
+        setCurrentView({ type: "application", applicationId: created.id });
+      }
     } catch (error) {
       setMessage(error.message);
     } finally {
@@ -375,22 +641,10 @@ function App() {
     }
   }
 
-  async function handleSampleDataLoad() {
-    setLoading(true);
+  async function resetGlobalScore(applicationId) {
     try {
-      await api.loadSampleData(token);
-      await refreshAll();
-    } catch (error) {
-      setMessage(error.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function handleSampleDataClear() {
-    setLoading(true);
-    try {
-      await api.clearSampleData(token);
+      setLoading(true);
+      await api.resetGlobalScore(token, applicationId);
       await refreshAll();
     } catch (error) {
       setMessage(error.message);
@@ -403,11 +657,45 @@ function App() {
     currentView.type === "application"
       ? applications.find((application) => application.id === currentView.applicationId)
       : null;
+  const dashboardByApplicationId = new Map(
+    dashboard.map((entry) => [entry.application_id, entry]),
+  );
+  const landingApplications = applications.map((application) => ({
+    application,
+    health: dashboardByApplicationId.get(application.id) || null,
+  }));
   const selectedDashboard = selectedApplication
-    ? dashboard.find((entry) => entry.application_id === selectedApplication.id)
+    ? dashboardByApplicationId.get(selectedApplication.id)
     : null;
-  const canEditSelected =
-    selectedApplication && user && (user.is_admin || selectedApplication.owner_id === user.id);
+  const isHealthRangeStale =
+    Boolean(dashboardRange.startAt && dashboardRange.endAt) &&
+    (dashboardRange.startAt !== landingStartAt || dashboardRange.endAt !== landingEndAt);
+  const landingProgressPercent =
+    landingRequestProgress.totalSteps > 0
+      ? Math.min(100, (landingRequestProgress.completedSteps / landingRequestProgress.totalSteps) * 100)
+      : 0;
+  const landingTimelineChartKey = [
+    landingStartAt,
+    landingEndAt,
+    globalTimeline[0]?.timestamp ?? "empty",
+    globalTimeline[globalTimeline.length - 1]?.timestamp ?? "empty",
+    globalTimeline.length,
+  ].join(":");
+  const applicationTimelineChartKey = [
+    currentView.applicationId ?? "none",
+    windowHours,
+    errorCode || "all",
+    applicationHistory[0]?.timestamp ?? "empty",
+    applicationHistory[applicationHistory.length - 1]?.timestamp ?? "empty",
+    applicationHistory.length,
+  ].join(":");
+  const selectedHealthScore = selectedDashboard?.healthy_score;
+  const selectedCurrentHealth = selectedDashboard?.current_health;
+  const isReadonlyUser = user?.role === "readonly";
+  const canManageProjects = user && (user.is_admin || user.role === "owner");
+  const canManageSelected =
+    selectedApplication && user && (user.is_admin || (user.role === "owner" && selectedApplication.owner_id === user.id));
+  const canEditSelected = selectedApplication && user && (isReadonlyUser || canManageSelected);
   const filteredLatestTests = tests
     .filter((test) => {
       const matchesQuery =
@@ -459,6 +747,24 @@ function App() {
     setShowTestModal(true);
   }
 
+  function openCreateApplicationModal() {
+    setEditingApplicationId(null);
+    setApplicationForm(defaultApplicationForm);
+    setShowApplicationModal(true);
+  }
+
+  function openEditApplicationModal() {
+    if (!selectedApplication) {
+      return;
+    }
+    setEditingApplicationId(selectedApplication.id);
+    setApplicationForm({
+      name: selectedApplication.name,
+      url: selectedApplication.url,
+    });
+    setShowApplicationModal(true);
+  }
+
   function openEditTestModal(test) {
     setEditingTestId(test.id);
     setTestForm({
@@ -472,14 +778,14 @@ function App() {
     setShowTestModal(true);
   }
 
-  if (!token || !user) {
+  if (!token) {
     return (
       <div className="page auth-page">
         <section className="auth-card">
           <p className="eyebrow">Status monitoring, sparse storage</p>
           <h1>StatusCake Home Made</h1>
           <p className="subdued">
-            Use the generated admin credentials from backend startup logs, or register a new owner account.
+            Use the backend credentials from startup logs or deployment configuration, or register a new owner account.
           </p>
           <form onSubmit={submitAuth} className="stack">
             <input
@@ -524,19 +830,19 @@ function App() {
               : "Application details, test creation, and failure history live here."}
           </p>
         </div>
-        <div className="hero-actions">
+          <div className="hero-actions">
           <div className="user-card">
-            <span>{user.username}</span>
-            <strong>{user.is_admin ? "Admin" : "Owner"}</strong>
+            <span>{user?.username || "Signed in"}</span>
+            <strong>{user ? (user.is_admin ? "Admin" : user.role === "readonly" ? "Readonly" : "Owner") : "Session active"}</strong>
           </div>
           {currentView.type === "application" ? (
             <button className="ghost-button" onClick={() => setCurrentView({ type: "landing", applicationId: null })}>
               Back to landing
             </button>
           ) : (
-            <button className="ghost-button" onClick={() => setShowApplicationModal(true)}>
+            canManageProjects ? <button className="ghost-button" onClick={openCreateApplicationModal}>
               New application
-            </button>
+            </button> : null
           )}
           <button className="ghost-button" onClick={logout}>
             Logout
@@ -545,6 +851,22 @@ function App() {
       </header>
 
       {message ? <p className="message error">{message}</p> : null}
+
+      {currentView.type === "landing" && landingRequestProgress.active ? (
+        <section className="request-progress" aria-live="polite">
+          <div className="request-progress-copy">
+            <strong>{landingRequestProgress.title}</strong>
+            <span>
+              {landingRequestProgress.completedSteps}/{landingRequestProgress.totalSteps} requests completed
+            </span>
+            <span>{formatElapsedTime(landingElapsedMs)} elapsed</span>
+          </div>
+          <p className="subdued request-progress-step">{landingRequestProgress.currentStep}</p>
+          <div className="request-progress-track" role="progressbar" aria-valuenow={landingProgressPercent} aria-valuemin="0" aria-valuemax="100">
+            <span className="request-progress-fill" style={{ width: `${landingProgressPercent}%` }} />
+          </div>
+        </section>
+      ) : null}
 
       {currentView.type === "landing" ? (
         <main className="grid landing-grid">
@@ -555,6 +877,9 @@ function App() {
                 <h2>Application evolution</h2>
               </div>
               <div className="filters">
+                <button className="ghost-button" disabled={loading || landingRequestProgress.active} onClick={() => void refreshLanding()}>
+                  Refresh chart
+                </button>
                 <select value={landingWindowHours} onChange={(event) => applyLandingRange(event.target.value)}>
                   <option value="">Custom range</option>
                   {landingRangeOptions.map((option) => (
@@ -579,26 +904,20 @@ function App() {
                     setLandingEndAt(event.target.value);
                   }}
                 />
-                <div className="sample-actions">
-                  <button disabled={loading || sampleState.loaded} onClick={handleSampleDataLoad}>
-                    {sampleState.loaded ? "Sample data loaded" : "Load sample data"}
-                  </button>
-                  <button className="ghost-button" disabled={loading || !sampleState.loaded} onClick={handleSampleDataClear}>
-                    Clear sample data
-                  </button>
-                </div>
               </div>
             </div>
             <div className="chart-shell timeline-chart">
               <ResponsiveContainer width="100%" height={380}>
-                <LineChart data={globalTimeline}>
+                <LineChart key={landingTimelineChartKey} data={globalTimeline}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#294048" />
                   <XAxis dataKey="label" minTickGap={36} stroke="#9ab0b7" />
                   <YAxis domain={[0, 100]} stroke="#9ab0b7" />
-                  <Tooltip />
+                  <Tooltip formatter={(value) => formatPercentage(value)} />
+                  <Legend />
                   {applications.map((application, index) => (
                     <Line
                       key={application.id}
+                      name={application.name}
                       type="monotone"
                       dataKey={`app_${application.id}`}
                       stroke={landingPalette[index % landingPalette.length]}
@@ -627,6 +946,19 @@ function App() {
               <div>
                 <p className="eyebrow">Applications</p>
                 <h2>Health score ranking</h2>
+                <p className="subdued panel-meta">
+                  Calculated from {formatRangeDateTime(dashboardRange.startAt)} to {formatRangeDateTime(dashboardRange.endAt)}
+                </p>
+                {isHealthRangeStale ? (
+                  <p className="panel-meta panel-meta-alert">
+                    Top range changed. Refresh health to realign this ranking.
+                  </p>
+                ) : null}
+              </div>
+              <div className="filters">
+                <button className="ghost-button" disabled={healthLoading} onClick={() => void refreshLandingHealth()}>
+                  {healthLoading ? "Refreshing health..." : "Refresh health"}
+                </button>
               </div>
             </div>
             <div className="table-shell">
@@ -642,28 +974,32 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {dashboard.map((application) => (
-                    <tr key={application.application_id}>
-                      <td>{application.application_name}</td>
-                      <td className={application.healthy_score > 99 ? "good" : "bad"}>
-                        {application.healthy_score.toFixed(3)}%
+                  {landingApplications.map(({ application, health }) => (
+                    <tr key={application.id}>
+                      <td>{application.name}</td>
+                      <td className={health ? (health.healthy_score > 99 ? "good" : "bad") : ""}>
+                        {health ? `${health.healthy_score.toFixed(3)}%` : "--"}
                       </td>
-                      <td className={application.current_health > 50 ? "good" : "bad"}>
-                        {application.current_health.toFixed(3)}%
+                      <td className={health ? (health.current_health > 50 ? "good" : "bad") : ""}>
+                        {health ? `${health.current_health.toFixed(3)}%` : "--"}
                       </td>
-                      <td>{application.global_score.toFixed(3)}</td>
+                      <td>{health ? health.global_score.toFixed(3) : "--"}</td>
                       <td>
-                        <span className={`trend trend-${application.score_trend}`}>
-                          {application.score_trend === "up" ? "↑ Increasing" : application.score_trend === "down" ? "↓ Decreasing" : "→ Stable"}
-                        </span>
+                        {health ? (
+                          <span className={`trend trend-${health.score_trend}`}>
+                            {health.score_trend === "up" ? "↑ Increasing" : health.score_trend === "down" ? "↓ Decreasing" : "→ Stable"}
+                          </span>
+                        ) : (
+                          <span className="subdued">Click refresh health</span>
+                        )}
                       </td>
                       <td>
                         <div className="inline-actions">
-                          <button onClick={() => setCurrentView({ type: "application", applicationId: application.application_id })}>
+                          <button onClick={() => setCurrentView({ type: "application", applicationId: application.id })}>
                             Open application
                           </button>
-                          {(user.is_admin || applications.find((item) => item.id === application.application_id)?.owner_id === user.id) ? (
-                            <button className="ghost-button" onClick={() => deleteApplication(application.application_id)}>
+                          {(user.is_admin || (user.role === "owner" && application.owner_id === user.id)) ? (
+                            <button className="ghost-button" onClick={() => deleteApplication(application.id)}>
                               Delete
                             </button>
                           ) : null}
@@ -671,6 +1007,11 @@ function App() {
                       </td>
                     </tr>
                   ))}
+                  {landingApplications.length === 0 ? (
+                    <tr>
+                      <td colSpan="6" className="subdued">No applications configured.</td>
+                    </tr>
+                  ) : null}
                 </tbody>
               </table>
             </div>
@@ -682,18 +1023,38 @@ function App() {
             <p className="eyebrow">Application</p>
             <h2>{selectedApplication?.name}</h2>
             <p className="subdued mono">{selectedApplication?.url}</p>
+            {canEditSelected ? (
+              <div className="inline-actions">
+                <button className="ghost-button" onClick={openEditApplicationModal}>
+                  {isReadonlyUser ? "Update host" : "Edit application"}
+                </button>
+                {user?.is_admin ? (
+                  <button
+                    className="ghost-button"
+                    disabled={loading}
+                    onClick={() => resetGlobalScore(selectedApplication.id)}
+                  >
+                    Reset global score to 999
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
             <div className="stat-grid">
               <div className="stat-card">
                 <span className="subdued">Health score</span>
-                <strong className={selectedApplication?.healthy_score > 99 ? "good" : "bad"}>
-                  {selectedApplication?.healthy_score?.toFixed(3)}%
+                <strong className={selectedHealthScore > 99 ? "good" : "bad"}>
+                  {formatPercentage(selectedHealthScore)}
                 </strong>
               </div>
               <div className="stat-card">
                 <span className="subdued">Current health</span>
-                <strong className={selectedApplication?.current_health > 50 ? "good" : "bad"}>
-                  {selectedApplication?.current_health?.toFixed(3)}%
+                <strong className={selectedCurrentHealth > 50 ? "good" : "bad"}>
+                  {formatPercentage(selectedCurrentHealth)}
                 </strong>
+              </div>
+              <div className="stat-card">
+                <span className="subdued">Global score</span>
+                <strong>{selectedDashboard?.global_score?.toFixed(3) ?? "999.000"}</strong>
               </div>
               <div className="stat-card">
                 <span className="subdued">Tests</span>
@@ -713,6 +1074,13 @@ function App() {
                 <h2>Health and error points</h2>
               </div>
               <div className="filters">
+                <button
+                  className="ghost-button"
+                  disabled={loading}
+                  onClick={() => void refreshApplicationView(currentView.applicationId)}
+                >
+                  Refresh chart
+                </button>
                 <select value={windowHours} onChange={(event) => setWindowHours(Number(event.target.value))}>
                   <option value={0.5}>30 minutes</option>
                   <option value={1}>1 hour</option>
@@ -733,7 +1101,7 @@ function App() {
             </div>
             <div className="chart-shell">
               <ResponsiveContainer width="100%" height={320}>
-                <LineChart data={applicationHistory}>
+                <LineChart key={applicationTimelineChartKey} data={applicationHistory}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#294048" />
                   <XAxis dataKey="label" minTickGap={36} stroke="#9ab0b7" />
                   <YAxis domain={[0, 100]} stroke="#9ab0b7" />
@@ -799,7 +1167,7 @@ function App() {
                 <p className="eyebrow">Latest test results</p>
                 <h2>Checks and latest execution snapshot</h2>
               </div>
-              {canEditSelected ? <button onClick={openCreateTestModal}>Add test</button> : null}
+              {canManageSelected ? <button onClick={openCreateTestModal}>Add test</button> : null}
             </div>
             <div className="filters table-filters">
               <input
@@ -863,12 +1231,22 @@ function App() {
                       <td>
                         {canEditSelected ? (
                           <div className="inline-actions">
+                            <a
+                              className="ghost-button"
+                              href={buildTestUrl(selectedApplication?.url || "", test.endpoint)}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              Open
+                            </a>
                             <button className="ghost-button" onClick={() => openEditTestModal(test)}>
                               Edit
                             </button>
-                            <button className="ghost-button" onClick={() => deleteTest(test.id)}>
-                              Delete
-                            </button>
+                            {canManageSelected ? (
+                              <button className="ghost-button" onClick={() => deleteTest(test.id)}>
+                                Delete
+                              </button>
+                            ) : null}
                           </div>
                         ) : (
                           <span className="subdued">View only</span>
@@ -878,7 +1256,7 @@ function App() {
                   ))}
                   {filteredLatestTests.length === 0 ? (
                     <tr>
-                      <td colSpan="5" className="subdued">No tests match the current filters.</td>
+                      <td colSpan="6" className="subdued">No tests match the current filters.</td>
                     </tr>
                   ) : null}
                 </tbody>
@@ -959,15 +1337,20 @@ function App() {
       )}
 
       {showApplicationModal ? (
-        <div className="modal-backdrop" onClick={() => setShowApplicationModal(false)}>
+        <div className="modal-backdrop" onClick={() => {
+          setShowApplicationModal(false);
+          setEditingApplicationId(null);
+          setApplicationForm(defaultApplicationForm);
+        }}>
           <section className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <p className="eyebrow">New application</p>
-            <h2>Create monitored app</h2>
+            <p className="eyebrow">{editingApplicationId ? (isReadonlyUser ? "Update host" : "Edit application") : "New application"}</p>
+            <h2>{editingApplicationId ? (isReadonlyUser ? "Update application host" : "Edit monitored app") : "Create monitored app"}</h2>
             <form className="stack" onSubmit={submitApplication}>
               <input
                 placeholder="Application name"
                 value={applicationForm.name}
                 onChange={(event) => setApplicationForm({ ...applicationForm, name: event.target.value })}
+                disabled={isReadonlyUser && Boolean(editingApplicationId)}
               />
               <input
                 placeholder="Base URL"
@@ -975,11 +1358,15 @@ function App() {
                 onChange={(event) => setApplicationForm({ ...applicationForm, url: event.target.value })}
               />
               <div className="modal-actions">
-                <button className="ghost-button" type="button" onClick={() => setShowApplicationModal(false)}>
+                <button className="ghost-button" type="button" onClick={() => {
+                  setShowApplicationModal(false);
+                  setEditingApplicationId(null);
+                  setApplicationForm(defaultApplicationForm);
+                }}>
                   Cancel
                 </button>
                 <button disabled={loading} type="submit">
-                  Create application
+                  {editingApplicationId ? "Save application" : "Create application"}
                 </button>
               </div>
             </form>
@@ -988,7 +1375,11 @@ function App() {
       ) : null}
 
       {showTestModal ? (
-        <div className="modal-backdrop" onClick={() => setShowTestModal(false)}>
+        <div className="modal-backdrop" onClick={() => {
+          setShowTestModal(false);
+          setEditingTestId(null);
+          setTestForm(defaultTestForm);
+        }}>
           <section className="modal-card" onClick={(event) => event.stopPropagation()}>
             <p className="eyebrow">{editingTestId ? "Edit test" : "New test"}</p>
             <h2>{editingTestId ? "Update application test" : "Create application test"}</h2>
@@ -1000,7 +1391,7 @@ function App() {
                   placeholder="Homepage health"
                   value={testForm.name}
                   onChange={(event) => setTestForm({ ...testForm, name: event.target.value })}
-                  disabled={!canEditSelected}
+                  disabled={!canEditSelected || isReadonlyUser}
                 />
               </label>
               <label className="field-group">
@@ -1019,7 +1410,7 @@ function App() {
                 <select
                   value={testForm.method}
                   onChange={(event) => setTestForm({ ...testForm, method: event.target.value })}
-                  disabled={!canEditSelected}
+                  disabled={!canEditSelected || isReadonlyUser}
                 >
                   <option value="GET">GET</option>
                   <option value="POST">POST</option>
@@ -1042,7 +1433,7 @@ function App() {
                   placeholder='{"ping":true}'
                   value={testForm.payload}
                   onChange={(event) => setTestForm({ ...testForm, payload: event.target.value })}
-                  disabled={!canEditSelected || testForm.method !== "POST"}
+                  disabled={!canEditSelected || isReadonlyUser || testForm.method !== "POST"}
                 />
               </label>
               <label className="field-group">
@@ -1054,11 +1445,15 @@ function App() {
                   step="15"
                   value={testForm.frequency_seconds}
                   onChange={(event) => setTestForm({ ...testForm, frequency_seconds: event.target.value })}
-                  disabled={!canEditSelected}
+                  disabled={!canEditSelected || isReadonlyUser}
                 />
               </label>
               <div className="modal-actions">
-                <button className="ghost-button" type="button" onClick={() => setShowTestModal(false)}>
+                <button className="ghost-button" type="button" onClick={() => {
+                  setShowTestModal(false);
+                  setEditingTestId(null);
+                  setTestForm(defaultTestForm);
+                }}>
                   Cancel
                 </button>
                 <button disabled={loading || !canEditSelected} type="submit">

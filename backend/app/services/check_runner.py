@@ -12,11 +12,25 @@ from app.models.check_result import CheckResult
 from app.models.incident import Incident
 from app.models.test import Test
 
+MAX_ERROR_TEXT_LENGTH = 1000
+
 
 def _build_url(base_url: str, endpoint: str) -> str:
     if endpoint.startswith("http://") or endpoint.startswith("https://"):
         return endpoint
     return urljoin(base_url.rstrip("/") + "/", endpoint.lstrip("/"))
+
+
+def _truncate_error_text(value: str, limit: int = MAX_ERROR_TEXT_LENGTH) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}..."
+
+
+def _build_body_mismatch_detail(expected_result: str, actual_result: str) -> str:
+    expected_text = _truncate_error_text(expected_result)
+    actual_text = _truncate_error_text(actual_result)
+    return f"Expected: {expected_text}\nActual: {actual_text}"
 
 
 def _store_incident(db: Session, application_id: int, test_id: int, status: str, error_code: str, detail: str, started_at: datetime, http_status_code: int | None = None, response_body: str | None = None) -> None:
@@ -226,7 +240,7 @@ async def _run_single_test(db: Session, client: httpx.AsyncClient, test: Test) -
             test,
             started_at,
             "BODY_MISMATCH",
-            "Response body does not match expected result literally",
+            _build_body_mismatch_detail(test.expected_result, body),
             response.status_code,
             body[:4000],
             response_time_ms=response_time_ms,
@@ -238,7 +252,10 @@ async def _run_single_test(db: Session, client: httpx.AsyncClient, test: Test) -
 
 async def check_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
-        await run_all_checks()
+        try:
+            await run_all_checks()
+        except Exception as exc:
+            print(f"Check loop iteration failed: {exc}", flush=True)
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=15)
         except asyncio.TimeoutError:

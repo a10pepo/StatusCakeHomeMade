@@ -1,7 +1,9 @@
 import csv
+import io
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +14,7 @@ from app.models.incident import Incident
 from app.models.sample_data_state import SampleDataState
 from app.models.test import Test
 from app.models.user import User
+from app.schemas.history import CsvImportResult
 
 
 def _set_csv_field_size_limit() -> None:
@@ -22,6 +25,77 @@ def _set_csv_field_size_limit() -> None:
             return
         except OverflowError:
             limit //= 10
+
+
+def _is_http_method(value: str) -> bool:
+    return value.upper() in {"GET", "POST"}
+
+
+def _normalize_seed_row(row: dict[str, str]) -> tuple[str, str, str, str, str, str, int]:
+    name = (row.get("name") or "").strip()
+    if not name:
+        raise ValueError("Missing application name")
+    check_name = (row.get("checkname") or "").strip()
+
+    # Preferred format:
+    # name;checkname;baseurl;testbaseurl;testpath;testmethod;testresult;freq
+    test_base_url = (row.get("testbaseurl") or "").strip()
+    test_path = (row.get("testpath") or "").strip()
+    if test_base_url or test_path:
+        base_url = (row.get("baseurl") or "").strip()
+        raw_method = (row.get("testmethod") or "").strip()
+        raw_expected_result = row.get("testresult") or ""
+        raw_freq = (row.get("freq") or "").strip()
+
+        # Tolerate a common malformed 6-column variant:
+        # name;baseurl;testbaseurl;testpath;testresult;freq
+        # In this case DictReader shifts values into testmethod/testresult and leaves freq empty.
+        if not _is_http_method(raw_method) and raw_expected_result.strip().isdigit() and not raw_freq:
+            method = "GET"
+            expected_result = raw_method
+            frequency_seconds = max(15, int(raw_expected_result.strip()))
+        else:
+            method = raw_method.upper()
+            expected_result = raw_expected_result
+            frequency_seconds = max(15, int((raw_freq or "15").strip()))
+
+        if not base_url or not method or not test_path:
+            raise ValueError("Missing required fields for extended seed format")
+        endpoint = (
+            test_path
+            if not test_base_url or test_base_url == base_url
+            else f"{test_base_url.rstrip('/')}/{test_path.lstrip('/')}"
+        )
+        return name, (check_name or endpoint), base_url, endpoint, method, expected_result, frequency_seconds
+
+    # Legacy compact format:
+    # name;full_test_url;testmethod;testresult;freq
+    full_test_url = (row.get("baseurl") or "").strip()
+    method = (row.get("testbaseurl") or "").strip().upper()
+    expected_result = row.get("testpath") or ""
+    frequency_seconds = max(15, int((row.get("testmethod") or "15").strip()))
+    if not full_test_url or not method:
+        raise ValueError("Missing required fields for compact seed format")
+
+    parsed = urlsplit(full_test_url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"Invalid seed URL: {full_test_url}")
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    endpoint = parsed.path or "/"
+    if parsed.query:
+        endpoint = f"{endpoint}?{parsed.query}"
+    return name, (check_name or endpoint), base_url, endpoint, method, expected_result, frequency_seconds
+
+
+def _split_endpoint_for_csv(application_url: str, endpoint: str) -> tuple[str, str]:
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        parsed = urlsplit(endpoint)
+        test_base_url = f"{parsed.scheme}://{parsed.netloc}"
+        test_path = parsed.path or "/"
+        if parsed.query:
+            test_path = f"{test_path}?{parsed.query}"
+        return test_base_url, test_path
+    return application_url, endpoint or "/"
 
 
 def seed_startup_checks_from_csv(db: Session) -> None:
@@ -40,14 +114,15 @@ def seed_startup_checks_from_csv(db: Session) -> None:
         print("Startup seed skipped: admin user not found", flush=True)
         return
 
-    grouped_rows: dict[tuple[str, str], list[dict[str, str]]] = {}
+    grouped_rows: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = {}
     _set_csv_field_size_limit()
     with csv_path.open("r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle, delimiter=";")
         for row in reader:
-            app_name = row["name"].strip()
-            base_url = row["baseurl"].strip()
-            grouped_rows.setdefault((app_name, base_url), []).append(row)
+            app_name, check_name, base_url, endpoint, method, expected_result, frequency_seconds = _normalize_seed_row(row)
+            grouped_rows.setdefault((app_name, base_url), []).append(
+                (check_name, endpoint, method, expected_result, frequency_seconds)
+            )
 
     now = datetime.now(timezone.utc)
     for (app_name, base_url), rows in grouped_rows.items():
@@ -60,24 +135,121 @@ def seed_startup_checks_from_csv(db: Session) -> None:
         db.add(application)
         db.flush()
 
-        for index, row in enumerate(rows, start=1):
-            test_base_url = row["testbaseurl"].strip()
-            test_path = row["testpath"].strip()
-            endpoint = test_path if test_base_url == base_url else f"{test_base_url.rstrip('/')}/{test_path.lstrip('/')}"
+        for check_name, endpoint, method, expected_result, frequency_seconds in rows:
             test = Test(
                 application_id=application.id,
-                name=f"{app_name} Check {index}",
+                name=check_name,
                 endpoint=endpoint,
-                method=row["testmethod"].strip().upper(),
-                expected_result=row["testresult"],
+                method=method,
+                expected_result=expected_result,
                 payload=None,
-                frequency_seconds=max(15, int(row["freq"])),
+                frequency_seconds=frequency_seconds,
                 created_at=now,
             )
             db.add(test)
 
     db.commit()
     print(f"Startup seed loaded {len(grouped_rows)} application(s) from {csv_path}", flush=True)
+
+
+def import_checks_from_csv(db: Session, csv_content: str) -> CsvImportResult:
+    grouped_rows: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = {}
+    _set_csv_field_size_limit()
+    reader = csv.DictReader(io.StringIO(csv_content), delimiter=";")
+    for row in reader:
+        app_name, check_name, base_url, endpoint, method, expected_result, frequency_seconds = _normalize_seed_row(row)
+        grouped_rows.setdefault((app_name, base_url), []).append(
+            (check_name, endpoint, method, expected_result, frequency_seconds)
+        )
+
+    applications_created = 0
+    applications_updated = 0
+    tests_created = 0
+    tests_updated = 0
+
+    for (app_name, base_url), rows in grouped_rows.items():
+        application = db.query(Application).filter(Application.name == app_name).first()
+        if application:
+            if application.url != base_url:
+                application.url = base_url
+                applications_updated += 1
+        else:
+            admin = db.query(User).filter(User.is_admin.is_(True)).first()
+            if not admin:
+                raise ValueError("Admin user not found")
+            application = Application(name=app_name, url=base_url, owner_id=admin.id)
+            db.add(application)
+            db.flush()
+            applications_created += 1
+
+        for check_name, endpoint, method, expected_result, frequency_seconds in rows:
+            test = db.query(Test).filter(Test.application_id == application.id, Test.name == check_name).first()
+            if not test:
+                test = (
+                    db.query(Test)
+                    .filter(
+                        Test.application_id == application.id,
+                        Test.endpoint == endpoint,
+                        Test.method == method,
+                    )
+                    .first()
+                )
+            if test:
+                test.name = check_name
+                test.endpoint = endpoint
+                test.method = method
+                test.expected_result = expected_result
+                test.frequency_seconds = frequency_seconds
+                tests_updated += 1
+            else:
+                test = Test(
+                    application_id=application.id,
+                    name=check_name,
+                    endpoint=endpoint,
+                    method=method,
+                    expected_result=expected_result,
+                    payload=None,
+                    frequency_seconds=frequency_seconds,
+                )
+                db.add(test)
+                tests_created += 1
+
+            db.add(application)
+            db.add(test)
+
+    db.commit()
+    return CsvImportResult(
+        applications_created=applications_created,
+        applications_updated=applications_updated,
+        tests_created=tests_created,
+        tests_updated=tests_updated,
+    )
+
+
+def export_checks_to_csv(db: Session) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=";", lineterminator="\n")
+    writer.writerow(["name", "checkname", "baseurl", "testbaseurl", "testpath", "testmethod", "testresult", "freq"])
+
+    applications = db.query(Application).order_by(Application.name.asc(), Application.created_at.asc()).all()
+    for application in applications:
+        tests = db.query(Test).filter(Test.application_id == application.id).order_by(Test.created_at.asc(), Test.id.asc()).all()
+        for test in tests:
+            test_base_url, test_path = _split_endpoint_for_csv(application.url, test.endpoint)
+            writer.writerow(
+                [
+                    application.name,
+                    test.name,
+                    application.url,
+                    test_base_url,
+                    test_path,
+                    test.method,
+                    test.expected_result,
+                    test.frequency_seconds,
+                ]
+            )
+
+    return output.getvalue()
 
 
 def get_or_create_sample_state(db: Session) -> SampleDataState:

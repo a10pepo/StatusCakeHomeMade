@@ -10,6 +10,8 @@ if ! command -v terraform >/dev/null 2>&1; then
   exit 1
 fi
 
+gcloud config set project edem2526
+
 echo "Initializing Terraform..."
 cd "${TERRAFORM_DIR}"
 terraform init

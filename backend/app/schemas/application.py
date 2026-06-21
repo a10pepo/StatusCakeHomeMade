@@ -14,15 +14,20 @@ class ApplicationUpdate(BaseModel):
     owner_id: int | None = None
 
 
-class ApplicationResponse(BaseModel):
+class ApplicationConfigResponse(BaseModel):
     id: int
     name: str
     url: str
     owner_id: int
     owner_username: str
     created_at: datetime
+    tests_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ApplicationResponse(ApplicationConfigResponse):
     healthy_score: float
     current_health: float
-    tests_count: int
 
     model_config = ConfigDict(from_attributes=True)

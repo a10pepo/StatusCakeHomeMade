@@ -22,6 +22,16 @@ def history_step(window_hours: float) -> timedelta:
     return timedelta(hours=1)
 
 
+def align_time_to_step(value: datetime, step: timedelta) -> datetime:
+    step_seconds = int(step.total_seconds())
+    if step_seconds <= 0:
+        return value.astimezone(timezone.utc)
+
+    utc_value = value.astimezone(timezone.utc)
+    aligned_timestamp = int(utc_value.timestamp()) // step_seconds * step_seconds
+    return datetime.fromtimestamp(aligned_timestamp, tz=timezone.utc)
+
+
 def _latest_health_score_from_results(results: list[CheckResult]) -> float:
     if not results:
         return 0.0
@@ -216,6 +226,7 @@ def calculate_global_score(db: Session, application: Application, start_time: da
     # move from 999 down to roughly 500.
     failure_penalty = 499.0 / ((20 * 60 * 60) / 15)
     latency_penalty = failure_penalty / 2
+    slow_success_penalty = 0.001
     has_success = False
     response_time_totals: dict[int, float] = defaultdict(float)
     response_time_counts: dict[int, int] = defaultdict(int)
@@ -237,6 +248,13 @@ def calculate_global_score(db: Session, application: Application, start_time: da
                     score -= latency_penalty
             else:
                 has_success = True
+                if (
+                    result.response_time_ms is not None
+                    and prior_average is not None
+                    and prior_average > 0
+                    and result.response_time_ms >= prior_average * 1.1
+                ):
+                    score -= slow_success_penalty
 
         if result.response_time_ms is not None:
             response_time_totals[result.test_id] += result.response_time_ms

@@ -16,7 +16,6 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       DATABASE_URL: postgresql://statuscake:statuscake@db:5432/statuscake
-      SECRET_KEY: statuscake-secret-key
       FRONTEND_ORIGIN: http://localhost:5173
     depends_on:
       - db

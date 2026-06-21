@@ -2,7 +2,7 @@ from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token, get_password_hash, verify_password
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.auth import LoginRequest, UserCreate
 
 
@@ -15,6 +15,7 @@ def register_user(db: Session, payload: UserCreate) -> User:
         username=payload.username,
         password_hash=get_password_hash(payload.password),
         is_admin=False,
+        role=UserRole.OWNER,
     )
     db.add(user)
     db.commit()

@@ -176,6 +176,15 @@ textarea {
   color: var(--muted);
 }
 
+.panel-meta {
+  margin: 0.35rem 0 0;
+  font-size: 0.92rem;
+}
+
+.panel-meta-alert {
+  color: #ffc7cf;
+}
+
 .stack {
   display: grid;
   gap: 0.8rem;
@@ -196,6 +205,41 @@ textarea {
 .error {
   background: rgba(240, 91, 110, 0.12);
   color: #ffc7cf;
+}
+
+.request-progress {
+  margin: 0 0 1rem;
+  padding: 1rem 1.1rem;
+  border: 1px solid rgba(154, 176, 183, 0.14);
+  border-radius: 22px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.request-progress-copy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.85rem;
+  align-items: baseline;
+}
+
+.request-progress-step {
+  margin: 0.45rem 0 0.8rem;
+}
+
+.request-progress-track {
+  width: 100%;
+  height: 0.65rem;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(154, 176, 183, 0.18);
+}
+
+.request-progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #f7c65c, #2ad28b);
+  transition: width 180ms ease;
 }
 
 .sample-actions,

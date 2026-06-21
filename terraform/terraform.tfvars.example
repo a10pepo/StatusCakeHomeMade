@@ -1,7 +1,8 @@
 project_id      = "edem2526"
-region          = "europe-north2"
+region          = "europe-southwest1"
 name_prefix     = "statuscake"
 deploy_services = false
+manage_project_services = false
 
 db_name     = "statuscake"
 db_username = "statuscake"

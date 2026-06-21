@@ -51,3 +51,10 @@ class TestResultRow(BaseModel):
 class SampleDataStatus(BaseModel):
     loaded: bool
     loaded_at: datetime | None = None
+
+
+class CsvImportResult(BaseModel):
+    applications_created: int
+    applications_updated: int
+    tests_created: int
+    tests_updated: int

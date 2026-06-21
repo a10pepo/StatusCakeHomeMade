@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, require_admin_or_owner
+from app.api.deps import can_limited_update_test, can_manage_tests, get_current_user, require_admin_or_owner
 from app.db.session import get_db
 from app.models.application import Application
 from app.models.test import Test
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.test import TestCreate, TestResponse, TestUpdate
 
 router = APIRouter(prefix="/api", tags=["tests"])
@@ -24,6 +24,8 @@ def create_test(application_id: int, payload: TestCreate, db: Session = Depends(
     application = db.query(Application).filter(Application.id == application_id).first()
     if not application:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Application not found")
+    if not can_manage_tests(application, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
     require_admin_or_owner(application, current_user)
 
     test = Test(application_id=application.id, **payload.model_dump())
@@ -38,10 +40,16 @@ def update_test(test_id: int, payload: TestUpdate, db: Session = Depends(get_db)
     test = db.query(Test).filter(Test.id == test_id).first()
     if not test:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Test not found")
-    require_admin_or_owner(test.application, current_user)
+    if not can_limited_update_test(test, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
 
-    for key, value in payload.model_dump().items():
-        setattr(test, key, value)
+    if current_user.role == UserRole.READONLY:
+        test.endpoint = payload.endpoint
+        test.expected_result = payload.expected_result
+    else:
+        require_admin_or_owner(test.application, current_user)
+        for key, value in payload.model_dump().items():
+            setattr(test, key, value)
 
     db.add(test)
     db.commit()
@@ -54,6 +62,8 @@ def delete_test(test_id: int, db: Session = Depends(get_db), current_user: User 
     test = db.query(Test).filter(Test.id == test_id).first()
     if not test:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Test not found")
+    if not can_manage_tests(test.application, current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
     require_admin_or_owner(test.application, current_user)
     db.delete(test)
     db.commit()

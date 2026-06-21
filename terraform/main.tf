@@ -16,13 +16,13 @@ locals {
 }
 
 resource "google_project_service" "services" {
-  for_each = toset([
+  for_each = var.manage_project_services ? toset([
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "run.googleapis.com",
     "sqladmin.googleapis.com",
     "iam.googleapis.com",
-  ])
+  ]) : toset([])
 
   project = var.project_id
   service = each.value
@@ -91,9 +91,9 @@ resource "google_project_iam_member" "backend_cloudsql_client" {
 }
 
 resource "google_sql_database_instance" "postgres" {
-  name             = "${var.name_prefix}-postgres"
-  region           = var.region
-  database_version = "POSTGRES_16"
+  name                = "${var.name_prefix}-postgres"
+  region              = var.region
+  database_version    = "POSTGRES_16"
   deletion_protection = false
 
   settings {
@@ -103,8 +103,8 @@ resource "google_sql_database_instance" "postgres" {
     availability_type = var.db_availability_type
 
     ip_configuration {
-      ipv4_enabled    = true
-      ssl_mode        = "ALLOW_UNENCRYPTED_AND_ENCRYPTED"
+      ipv4_enabled = true
+      ssl_mode     = "ALLOW_UNENCRYPTED_AND_ENCRYPTED"
     }
 
     backup_configuration {
@@ -138,8 +138,8 @@ resource "google_cloud_run_v2_service" "backend" {
     service_account = google_service_account.backend.email
 
     scaling {
-      min_instance_count = 0
-      max_instance_count = 1
+      min_instance_count = var.backend_min_instances
+      max_instance_count = var.backend_max_instances
     }
 
     volumes {
@@ -187,11 +187,6 @@ resource "google_cloud_run_v2_service" "backend" {
         value = "/tmp/generated_admin_password.txt"
       }
 
-      env {
-        name  = "STARTUP_SEED_CSV_PATH"
-        value = "/app/data/samplechecks.csv"
-      }
-
       volume_mounts {
         name       = "cloudsql"
         mount_path = "/cloudsql"
@@ -228,7 +223,7 @@ resource "google_cloud_run_v2_service" "frontend" {
     service_account = google_service_account.frontend.email
 
     scaling {
-      min_instance_count = 0
+      min_instance_count = 1
       max_instance_count = 1
     }
 
